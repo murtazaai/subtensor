@@ -4,6 +4,11 @@ use frame_support::IterableStorageDoubleMap;
 use sp_std::vec;
 use substrate_fixed::types::{I32F32, I64F64, I96F32};
 
+enum ConditionalReturnType<T> {
+    A(Vec<I32F32>),
+    B(Vec<(T::AccountId, u64, u64)>),
+}
+
 impl<T: Config> Pallet<T> {
     /// Calculates reward consensus and returns the emissions for uids/hotkeys in a given `netuid`.
     /// (Dense version used only for testing purposes.)
@@ -348,7 +353,7 @@ impl<T: Config> Pallet<T> {
     ///     - Print debugging outputs.
     ///
     #[allow(clippy::indexing_slicing)]
-    pub fn epoch(netuid: u16, rao_emission: u64) -> Vec<(T::AccountId, u64, u64)> {
+    pub fn epoch(netuid: u16, incentivised: bool) -> ConditionalReturnType<T> {
         // Get subnetwork size.
         let n: u16 = Self::get_subnetwork_n(netuid);
         log::trace!("Number of Neurons in Network: {:?}", n);
@@ -502,205 +507,214 @@ impl<T: Config> Pallet<T> {
         let incentive: Vec<I32F32> = ranks.clone();
         log::trace!("Incentive (=Rank): {:?}", &incentive);
 
-        // =========================
-        // == Bonds and Dividends ==
-        // =========================
+        if incentivised {
+            ConditionalReturnType::A(incentive)
+        } else {
 
-        // Access network bonds.
-        let mut bonds: Vec<Vec<(u16, I32F32)>> = Self::get_bonds_sparse(netuid);
-        log::trace!("B: {:?}", &bonds);
+            // =========================
+            // == Bonds and Dividends ==
+            // =========================
 
-        // Remove bonds referring to deregistered neurons.
-        bonds = vec_mask_sparse_matrix(
-            &bonds,
-            &last_update,
-            &block_at_registration,
-            &|updated, registered| updated <= registered,
-        );
-        log::trace!("B (outdatedmask): {:?}", &bonds);
+            // Access network bonds.
+            let mut bonds: Vec<Vec<(u16, I32F32)>> = Self::get_bonds_sparse(netuid);
+            log::trace!("B: {:?}", &bonds);
 
-        // Normalize remaining bonds: sum_i b_ij = 1.
-        inplace_col_normalize_sparse(&mut bonds, n);
-        log::trace!("B (mask+norm): {:?}", &bonds);
+            // Remove bonds referring to deregistered neurons.
+            bonds = vec_mask_sparse_matrix(
+                &bonds,
+                &last_update,
+                &block_at_registration,
+                &|updated, registered| updated <= registered,
+            );
+            log::trace!("B (outdatedmask): {:?}", &bonds);
 
-        // Compute bonds delta column normalized.
-        let mut bonds_delta: Vec<Vec<(u16, I32F32)>> = row_hadamard_sparse(&weights, &active_stake); // ΔB = W◦S (outdated W masked)
-        log::trace!("ΔB: {:?}", &bonds_delta);
+            // Normalize remaining bonds: sum_i b_ij = 1.
+            inplace_col_normalize_sparse(&mut bonds, n);
+            log::trace!("B (mask+norm): {:?}", &bonds);
 
-        // Normalize bonds delta.
-        inplace_col_normalize_sparse(&mut bonds_delta, n); // sum_i b_ij = 1
-        log::trace!("ΔB (norm): {:?}", &bonds_delta);
+            // Compute bonds delta column normalized.
+            let mut bonds_delta: Vec<Vec<(u16, I32F32)>> = row_hadamard_sparse(&weights, &active_stake); // ΔB = W◦S (outdated W masked)
+            log::trace!("ΔB: {:?}", &bonds_delta);
 
-        // Compute the Exponential Moving Average (EMA) of bonds.
-        let mut ema_bonds =
-            Self::compute_ema_bonds_sparse(netuid, consensus.clone(), bonds_delta, bonds);
-        // Normalize EMA bonds.
-        inplace_col_normalize_sparse(&mut ema_bonds, n); // sum_i b_ij = 1
-        log::trace!("Exponential Moving Average Bonds: {:?}", &ema_bonds);
+            // Normalize bonds delta.
+            inplace_col_normalize_sparse(&mut bonds_delta, n); // sum_i b_ij = 1
+            log::trace!("ΔB (norm): {:?}", &bonds_delta);
 
-        // Compute dividends: d_i = SUM(j) b_ij * inc_j.
-        // range: I32F32(0, 1)
-        let mut dividends: Vec<I32F32> = matmul_transpose_sparse(&ema_bonds, &incentive);
-        inplace_normalize(&mut dividends);
-        log::trace!("Dividends: {:?}", &dividends);
+            // Compute the Exponential Moving Average (EMA) of bonds.
+            let mut ema_bonds =
+                Self::compute_ema_bonds_sparse(netuid, consensus.clone(), bonds_delta, bonds);
+            // Normalize EMA bonds.
+            inplace_col_normalize_sparse(&mut ema_bonds, n); // sum_i b_ij = 1
+            log::trace!("Exponential Moving Average Bonds: {:?}", &ema_bonds);
 
-        // =================================
-        // == Emission and Pruning scores ==
-        // =================================
+            // Compute dividends: d_i = SUM(j) b_ij * inc_j.
+            // range: I32F32(0, 1)
+            let mut dividends: Vec<I32F32> = matmul_transpose_sparse(&ema_bonds, &incentive);
+            inplace_normalize(&mut dividends);
+            log::trace!("Dividends: {:?}", &dividends);
 
-        // Compute normalized emission scores. range: I32F32(0, 1)
-        let combined_emission: Vec<I32F32> = incentive
-            .iter()
-            .zip(dividends.clone())
-            .map(|(ii, di)| ii.saturating_add(di))
-            .collect();
-        let emission_sum: I32F32 = combined_emission.iter().sum();
+            // =================================
+            // == Emission and Pruning scores ==
+            // =================================
 
-        let mut normalized_server_emission: Vec<I32F32> = incentive.clone(); // Servers get incentive.
-        let mut normalized_validator_emission: Vec<I32F32> = dividends.clone(); // Validators get dividends.
-        let mut normalized_combined_emission: Vec<I32F32> = combined_emission.clone();
-        // Normalize on the sum of incentive + dividends.
-        inplace_normalize_using_sum(&mut normalized_server_emission, emission_sum);
-        inplace_normalize_using_sum(&mut normalized_validator_emission, emission_sum);
-        inplace_normalize(&mut normalized_combined_emission);
+            // Compute normalized emission scores. range: I32F32(0, 1)
+            let combined_emission: Vec<I32F32> = incentive
+                .iter()
+                .zip(dividends.clone())
+                .map(|(ii, di)| ii.saturating_add(di))
+                .collect();
+            let emission_sum: I32F32 = combined_emission.iter().sum();
 
-        // If emission is zero, replace emission with normalized stake.
-        if emission_sum == I32F32::from(0) {
-            // no weights set | outdated weights | self_weights
-            if is_zero(&active_stake) {
-                // no active stake
-                normalized_validator_emission.clone_from(&stake); // do not mask inactive, assumes stake is normalized
-                normalized_combined_emission.clone_from(&stake);
-            } else {
-                normalized_validator_emission.clone_from(&active_stake); // emission proportional to inactive-masked normalized stake
-                normalized_combined_emission.clone_from(&active_stake);
+            let mut normalized_server_emission: Vec<I32F32> = incentive.clone(); // Servers get incentive.
+            let mut normalized_validator_emission: Vec<I32F32> = dividends.clone(); // Validators get dividends.
+            let mut normalized_combined_emission: Vec<I32F32> = combined_emission.clone();
+            // Normalize on the sum of incentive + dividends.
+            inplace_normalize_using_sum(&mut normalized_server_emission, emission_sum);
+            inplace_normalize_using_sum(&mut normalized_validator_emission, emission_sum);
+            inplace_normalize(&mut normalized_combined_emission);
+
+            // If emission is zero, replace emission with normalized stake.
+            if emission_sum == I32F32::from(0) {
+                // no weights set | outdated weights | self_weights
+                if is_zero(&active_stake) {
+                    // no active stake
+                    normalized_validator_emission.clone_from(&stake); // do not mask inactive, assumes stake is normalized
+                    normalized_combined_emission.clone_from(&stake);
+                } else {
+                    normalized_validator_emission.clone_from(&active_stake); // emission proportional to inactive-masked normalized stake
+                    normalized_combined_emission.clone_from(&active_stake);
+                }
             }
-        }
 
-        // Compute rao based emission scores. range: I96F32(0, rao_emission)
-        let float_rao_emission: I96F32 = I96F32::from_num(rao_emission);
+            // Compute rao based emission scores. range: I96F32(0, rao_emission)
+            let rao_emission = Self::get_emission_value(netuid);
+            let float_rao_emission: I96F32 = I96F32::from_num(rao_emission);
 
-        let server_emission: Vec<I96F32> = normalized_server_emission
-            .iter()
-            .map(|se: &I32F32| I96F32::from_num(*se).saturating_mul(float_rao_emission))
-            .collect();
-        let server_emission: Vec<u64> = server_emission
-            .iter()
-            .map(|e: &I96F32| e.to_num::<u64>())
-            .collect();
+            let server_emission: Vec<I96F32> = normalized_server_emission
+                .iter()
+                .map(|se: &I32F32| I96F32::from_num(*se).saturating_mul(float_rao_emission))
+                .collect();
+            let server_emission: Vec<u64> = server_emission
+                .iter()
+                .map(|e: &I96F32| e.to_num::<u64>())
+                .collect();
 
-        let validator_emission: Vec<I96F32> = normalized_validator_emission
-            .iter()
-            .map(|ve: &I32F32| I96F32::from_num(*ve).saturating_mul(float_rao_emission))
-            .collect();
-        let validator_emission: Vec<u64> = validator_emission
-            .iter()
-            .map(|e: &I96F32| e.to_num::<u64>())
-            .collect();
+            let validator_emission: Vec<I96F32> = normalized_validator_emission
+                .iter()
+                .map(|ve: &I32F32| I96F32::from_num(*ve).saturating_mul(float_rao_emission))
+                .collect();
+            let validator_emission: Vec<u64> = validator_emission
+                .iter()
+                .map(|e: &I96F32| e.to_num::<u64>())
+                .collect();
 
-        // Only used to track emission in storage.
-        let combined_emission: Vec<I96F32> = normalized_combined_emission
-            .iter()
-            .map(|ce: &I32F32| I96F32::from_num(*ce).saturating_mul(float_rao_emission))
-            .collect();
-        let combined_emission: Vec<u64> = combined_emission
-            .iter()
-            .map(|e: &I96F32| e.to_num::<u64>())
-            .collect();
+            // Only used to track emission in storage.
+            let combined_emission: Vec<I96F32> = normalized_combined_emission
+                .iter()
+                .map(|ce: &I32F32| I96F32::from_num(*ce).saturating_mul(float_rao_emission))
+                .collect();
+            let combined_emission: Vec<u64> = combined_emission
+                .iter()
+                .map(|e: &I96F32| e.to_num::<u64>())
+                .collect();
 
-        log::trace!(
+            log::trace!(
             "Normalized Server Emission: {:?}",
             &normalized_server_emission
         );
-        log::trace!("Server Emission: {:?}", &server_emission);
-        log::trace!(
+            log::trace!("Server Emission: {:?}", &server_emission);
+            log::trace!(
             "Normalized Validator Emission: {:?}",
             &normalized_validator_emission
         );
-        log::trace!("Validator Emission: {:?}", &validator_emission);
-        log::trace!(
+            log::trace!("Validator Emission: {:?}", &validator_emission);
+            log::trace!(
             "Normalized Combined Emission: {:?}",
             &normalized_combined_emission
         );
-        log::trace!("Combined Emission: {:?}", &combined_emission);
+            log::trace!("Combined Emission: {:?}", &combined_emission);
 
-        // Set pruning scores using combined emission scores.
-        let pruning_scores: Vec<I32F32> = normalized_combined_emission.clone();
-        log::trace!("Pruning Scores: {:?}", &pruning_scores);
+            // Set pruning scores using combined emission scores.
+            let pruning_scores: Vec<I32F32> = normalized_combined_emission.clone();
+            log::trace!("Pruning Scores: {:?}", &pruning_scores);
 
-        // ===================
-        // == Value storage ==
-        // ===================
-        let cloned_emission: Vec<u64> = combined_emission.clone();
-        let cloned_ranks: Vec<u16> = ranks
-            .iter()
-            .map(|xi| fixed_proportion_to_u16(*xi))
-            .collect::<Vec<u16>>();
-        let cloned_trust: Vec<u16> = trust
-            .iter()
-            .map(|xi| fixed_proportion_to_u16(*xi))
-            .collect::<Vec<u16>>();
-        let cloned_consensus: Vec<u16> = consensus
-            .iter()
-            .map(|xi| fixed_proportion_to_u16(*xi))
-            .collect::<Vec<u16>>();
-        let cloned_incentive: Vec<u16> = incentive
-            .iter()
-            .map(|xi| fixed_proportion_to_u16(*xi))
-            .collect::<Vec<u16>>();
-        let cloned_dividends: Vec<u16> = dividends
-            .iter()
-            .map(|xi| fixed_proportion_to_u16(*xi))
-            .collect::<Vec<u16>>();
-        let cloned_pruning_scores: Vec<u16> = vec_max_upscale_to_u16(&pruning_scores);
-        let cloned_validator_trust: Vec<u16> = validator_trust
-            .iter()
-            .map(|xi| fixed_proportion_to_u16(*xi))
-            .collect::<Vec<u16>>();
-        Active::<T>::insert(netuid, active.clone());
-        Emission::<T>::insert(netuid, cloned_emission);
-        Rank::<T>::insert(netuid, cloned_ranks);
-        Trust::<T>::insert(netuid, cloned_trust);
-        Consensus::<T>::insert(netuid, cloned_consensus);
-        Incentive::<T>::insert(netuid, cloned_incentive);
-        Dividends::<T>::insert(netuid, cloned_dividends);
-        PruningScores::<T>::insert(netuid, cloned_pruning_scores);
-        ValidatorTrust::<T>::insert(netuid, cloned_validator_trust);
-        ValidatorPermit::<T>::insert(netuid, new_validator_permits.clone());
+            // ===================
+            // == Value storage ==
+            // ===================
+            let cloned_emission: Vec<u64> = combined_emission.clone();
+            let cloned_ranks: Vec<u16> = ranks
+                .iter()
+                .map(|xi| fixed_proportion_to_u16(*xi))
+                .collect::<Vec<u16>>();
+            let cloned_trust: Vec<u16> = trust
+                .iter()
+                .map(|xi| fixed_proportion_to_u16(*xi))
+                .collect::<Vec<u16>>();
+            let cloned_consensus: Vec<u16> = consensus
+                .iter()
+                .map(|xi| fixed_proportion_to_u16(*xi))
+                .collect::<Vec<u16>>();
+            let cloned_incentive: Vec<u16> = incentive
+                .iter()
+                .map(|xi| fixed_proportion_to_u16(*xi))
+                .collect::<Vec<u16>>();
+            let cloned_dividends: Vec<u16> = dividends
+                .iter()
+                .map(|xi| fixed_proportion_to_u16(*xi))
+                .collect::<Vec<u16>>();
+            let cloned_pruning_scores: Vec<u16> = vec_max_upscale_to_u16(&pruning_scores);
+            let cloned_validator_trust: Vec<u16> = validator_trust
+                .iter()
+                .map(|xi| fixed_proportion_to_u16(*xi))
+                .collect::<Vec<u16>>();
+            Active::<T>::insert(netuid, active.clone());
+            Emission::<T>::insert(netuid, cloned_emission);
+            Rank::<T>::insert(netuid, cloned_ranks);
+            Trust::<T>::insert(netuid, cloned_trust);
+            Consensus::<T>::insert(netuid, cloned_consensus);
+            Incentive::<T>::insert(netuid, cloned_incentive);
+            Dividends::<T>::insert(netuid, cloned_dividends);
+            PruningScores::<T>::insert(netuid, cloned_pruning_scores);
+            ValidatorTrust::<T>::insert(netuid, cloned_validator_trust);
+            ValidatorPermit::<T>::insert(netuid, new_validator_permits.clone());
 
-        // Column max-upscale EMA bonds for storage: max_i w_ij = 1.
-        inplace_col_max_upscale_sparse(&mut ema_bonds, n);
-        new_validator_permits
-            .iter()
-            .zip(validator_permits)
-            .zip(ema_bonds)
-            .enumerate()
-            .for_each(|(i, ((new_permit, validator_permit), ema_bond))| {
-                // Set bonds only if uid retains validator permit, otherwise clear bonds.
-                if *new_permit {
-                    let new_bonds_row: Vec<(u16, u16)> = ema_bond
-                        .iter()
-                        .map(|(j, value)| (*j, fixed_proportion_to_u16(*value)))
-                        .collect();
-                    Bonds::<T>::insert(netuid, i as u16, new_bonds_row);
-                } else if validator_permit {
-                    // Only overwrite the intersection.
-                    let new_empty_bonds_row: Vec<(u16, u16)> = vec![];
-                    Bonds::<T>::insert(netuid, i as u16, new_empty_bonds_row);
-                }
-            });
+            // Column max-upscale EMA bonds for storage: max_i w_ij = 1.
+            inplace_col_max_upscale_sparse(&mut ema_bonds, n);
+            new_validator_permits
+                .iter()
+                .zip(validator_permits)
+                .zip(ema_bonds)
+                .enumerate()
+                .for_each(|(i, ((new_permit, validator_permit), ema_bond))| {
+                    // Set bonds only if uid retains validator permit, otherwise clear bonds.
+                    if *new_permit {
+                        let new_bonds_row: Vec<(u16, u16)> = ema_bond
+                            .iter()
+                            .map(|(j, value)| (*j, fixed_proportion_to_u16(*value)))
+                            .collect();
+                        Bonds::<T>::insert(netuid, i as u16, new_bonds_row);
+                    } else if validator_permit {
+                        // Only overwrite the intersection.
+                        let new_empty_bonds_row: Vec<(u16, u16)> = vec![];
+                        Bonds::<T>::insert(netuid, i as u16, new_empty_bonds_row);
+                    }
+                });
 
-        // Emission tuples ( hotkeys, server_emission, validator_emission )
-        hotkeys
-            .into_iter()
-            .map(|(uid_i, hotkey)| {
-                (
-                    hotkey,
-                    server_emission[uid_i as usize],
-                    validator_emission[uid_i as usize],
-                )
-            })
-            .collect()
+            // Emission tuples ( hotkeys, server_emission, validator_emission )
+            ConditionalReturnType::B(
+                hotkeys
+                .into_iter()
+                .map(|(uid_i, hotkey)| {
+                    (
+                        hotkey,
+                        server_emission[uid_i as usize],
+                        validator_emission[uid_i as usize],
+                    )
+                })
+                .collect()
+            )
+        }
+
     }
 
     pub fn get_float_rho(netuid: u16) -> I32F32 {
