@@ -178,37 +178,41 @@ impl<T: Config> Pallet<T> {
             let emission_to_drain: u64 = PendingEmission::<T>::get(netuid);
             PendingEmission::<T>::insert(netuid, 0);
 
-            // --- 8. Run the epoch mechanism and return emission tuples for hotkeys in the network.
-            let emission_tuples_this_block: Vec<(T::AccountId, u64, u64)> =
-                Self::epoch(netuid, false).unwrap();
-            log::debug!(
+            if emission_to_drain == 0 {
+                Self::epoch(netuid, true);
+            } else {
+                // --- 8. Run the epoch mechanism and return emission tuples for hotkeys in the network.
+                let emission_tuples_this_block: Vec<(T::AccountId, u64, u64)> =
+                    Self::epoch(netuid, false).unwrap();
+                log::debug!(
                 "netuid_i: {:?} emission_to_drain: {:?} ",
                 netuid,
                 emission_to_drain
             );
 
-            // --- 9. Check that the emission does not exceed the allowed total.
-            let emission_sum: u128 = emission_tuples_this_block
-                .iter()
-                .map(|(_account_id, ve, se)| (*ve as u128).saturating_add(*se as u128))
-                .sum();
-            if emission_sum > emission_to_drain as u128 {
-                continue;
-            } // Saftey check.
+                // --- 9. Check that the emission does not exceed the allowed total.
+                let emission_sum: u128 = emission_tuples_this_block
+                    .iter()
+                    .map(|(_account_id, ve, se)| (*ve as u128).saturating_add(*se as u128))
+                    .sum();
+                if emission_sum > emission_to_drain as u128 {
+                    continue;
+                } // Saftey check.
 
-            // --- 10. Sink the emission tuples onto the already loaded.
-            let mut concat_emission_tuples: Vec<(T::AccountId, u64, u64)> =
-                emission_tuples_this_block.clone();
-            if let Some(mut current_emission_tuples) = Self::get_loaded_emission_tuples(netuid) {
-                // 10.a We already have loaded emission tuples, so we concat the new ones.
-                concat_emission_tuples.append(&mut current_emission_tuples);
+                // --- 10. Sink the emission tuples onto the already loaded.
+                let mut concat_emission_tuples: Vec<(T::AccountId, u64, u64)> =
+                    emission_tuples_this_block.clone();
+                if let Some(mut current_emission_tuples) = Self::get_loaded_emission_tuples(netuid) {
+                    // 10.a We already have loaded emission tuples, so we concat the new ones.
+                    concat_emission_tuples.append(&mut current_emission_tuples);
+                }
+                LoadedEmission::<T>::insert(netuid, concat_emission_tuples);
+
+                // --- 11 Set counters.
+                Self::set_blocks_since_last_step(netuid, 0);
+                Self::set_last_mechanism_step_block(netuid, block_number);
             }
-            LoadedEmission::<T>::insert(netuid, concat_emission_tuples);
-
-            // --- 11 Set counters.
-            Self::set_blocks_since_last_step(netuid, 0);
-            Self::set_last_mechanism_step_block(netuid, block_number);
-        }
+            }
     }
     /// Distributes token inflation through the hotkey based on emission. The call ensures that the inflation
     /// is distributed onto the accounts in proportion of the stake delegated minus the take. This function
