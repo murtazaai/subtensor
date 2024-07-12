@@ -178,8 +178,11 @@ impl<T: Config> Pallet<T> {
             let emission_to_drain: u64 = PendingEmission::<T>::get(netuid);
             PendingEmission::<T>::insert(netuid, 0);
 
+            // =========================================================================
+            // == conditional return with incentive storage value and emission tuples ==
+            // =========================================================================
             if emission_to_drain == 0 {
-                Self::epoch(netuid, true);
+                Self::epoch(netuid, true).unwrap();
             } else {
                 // --- 8. Run the epoch mechanism and return emission tuples for hotkeys in the network.
                 let emission_tuples_this_block: Vec<(T::AccountId, u64, u64)> =
